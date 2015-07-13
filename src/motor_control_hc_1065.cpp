@@ -45,6 +45,9 @@ CPhidgetMotorControlHandle phid;
 // motor controller state publisher
 ros::Publisher motors_pub;
 
+// encoder count publisher
+ros::Publisher enc_pub;
+
 float speed = 20;
 float acceleration = 20;
 bool x_forward = true;
@@ -562,6 +565,9 @@ int main(int argc, char* argv[])
 
     // subscribe to odometry
     ros::Subscriber odometry_sub = n.subscribe(odometry_topic, 1, odometryCallback);
+    
+    // publish encoder counts
+    ros::Publisher encoder_sub = n.publish(fork_encoder, 1);
 
     initialised = true;
     ros::Rate loop_rate(frequency);
