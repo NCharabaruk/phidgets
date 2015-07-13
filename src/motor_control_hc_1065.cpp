@@ -38,6 +38,7 @@
 #include <geometry_msgs/Twist.h>
 #include <nav_msgs/Odometry.h>
 #include "phidgets/motor_params.h"
+#include "phidgets/encoder_params.h"
 
 // handle
 CPhidgetMotorControlHandle phid;
@@ -46,7 +47,7 @@ CPhidgetMotorControlHandle phid;
 ros::Publisher motors_pub;
 
 // encoder count publisher
-ros::Publisher enc_pub;
+ros::Publisher encoder_pub;
 
 float speed = 20;
 float acceleration = 20;
@@ -73,6 +74,8 @@ double max_angular_accel = 0.5;
 double max_linear_accel = 0.3;
 double ITerm[2];
 double last_v=0,last_angv=0;
+
+int count = 0;
 
 bool odometry_active = false;
 
@@ -144,6 +147,18 @@ int CurrentChangeHandler(CPhidgetMotorControlHandle MC, void *usrptr, int Index,
   return 0;
 }
 
+int EncoderChangeHandler(CPhidgetMotorControlHandle MC, void *userPtr, int Index, int Time, int positionChange)
+{
+  phidgets::encoder_params m;
+  m.index = Index;
+  m.count = count + positionChange;
+  m.count_change = positionChange;
+  m.time = Time;
+
+  if (initialised) encoder_pub.publish(m);
+  return 0;
+}
+
 int display_properties(CPhidgetMotorControlHandle phid)
 {
   int serial_number, version, num_motors, num_inputs;
@@ -171,30 +186,36 @@ bool attach(CPhidgetMotorControlHandle &phid, int serial_number)
   CPhidgetMotorControl_create(&phid);
 
   // Set the handlers to be run when the device is
-	// plugged in or opened from software, unplugged
-	// or closed from software, or generates an error.
+  // plugged in or opened from software, unplugged
+  // or closed from software, or generates an error.
   CPhidget_set_OnAttach_Handler((CPhidgetHandle)phid, AttachHandler, NULL);
   CPhidget_set_OnDetach_Handler((CPhidgetHandle)phid, DetachHandler, NULL);
   CPhidget_set_OnError_Handler((CPhidgetHandle)phid, ErrorHandler, NULL);
 
   // Registers a callback that will run if an input changes.
   // Requires the handle for the Phidget, the function
-	// that will be called, and a arbitrary pointer that
-	// will be supplied to the callback function (may be NULL).
+  // that will be called, and a arbitrary pointer that
+  // will be supplied to the callback function (may be NULL).
   CPhidgetMotorControl_set_OnInputChange_Handler (phid, InputChangeHandler, NULL);
 
   // Registers a callback that will run if a motor changes.
   // Requires the handle for the Phidget, the function
-	// that will be called, and a arbitrary pointer that
-	// will be supplied to the callback function (may be NULL).
+  // that will be called, and a arbitrary pointer that
+  // will be supplied to the callback function (may be NULL).
   CPhidgetMotorControl_set_OnVelocityChange_Handler (phid, VelocityChangeHandler, NULL);
 
   // Registers a callback that will run if the current
-	// draw changes.
+  // draw changes.
   // Requires the handle for the Phidget, the function
-	// that will be called, and a arbitrary pointer that
-	// will be supplied to the callback function (may be NULL).
+  // that will be called, and a arbitrary pointer that
+  // will be supplied to the callback function (may be NULL).
   CPhidgetMotorControl_set_OnCurrentChange_Handler (phid, CurrentChangeHandler, NULL);
+
+  // Registers a callback that will run when the encoder position in updated
+  // Requires a handle for the Phidget, the function
+  // that will be called, and an arbitrary pointer that
+  // will be supplied to the callback function (may be NULL).
+  CPhidgetMotorControl_set_OnEncoderPositionChange_Handler (phid, EncoderChangeHandler, NULL);
 
   //open the device for connections
   CPhidget_open((CPhidgetHandle)phid, serial_number);
@@ -567,7 +588,7 @@ int main(int argc, char* argv[])
     ros::Subscriber odometry_sub = n.subscribe(odometry_topic, 1, odometryCallback);
     
     // publish encoder counts
-    ros::Publisher encoder_sub = n.publish(fork_encoder, 1);
+    encoder_pub = n.advertise<phidgets::encoder_params>("fork_encoder", 5);
 
     initialised = true;
     ros::Rate loop_rate(frequency);
