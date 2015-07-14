@@ -36,6 +36,7 @@
 #include <sstream>
 #include <phidget21.h>
 #include <geometry_msgs/Twist.h>
+#include <std_msgs/Int32.h>
 #include <nav_msgs/Odometry.h>
 #include "phidgets/motor_params.h"
 #include "phidgets/encoder_params.h"
@@ -49,40 +50,68 @@ ros::Publisher motors_pub;
 // encoder count publisher
 ros::Publisher encoder_pub;
 
-float speed = 20;
 float acceleration = 20;
+float speed = 62.5;
 bool x_forward = true;
 bool invert_rotation = false;
 bool invert_forward = false;
 double rotation_offset = 0;
 
-nav_msgs::Odometry odom;
-double current_linear_velocity = 0;
-double current_angular_velocity = 0;
-double linear_velocity_proportional = 0.1;
-double linear_velocity_integral = 0.0;
-double linear_velocity_derivative = 0.0;
-double angular_velocity_proportional = 0.1;
-double angular_velocity_integral = 0.0;
-double angular_velocity_derivative = 0.0;
-double max_angular_velocity = 0.1;
-double linear_deadband = 0.02;
-double angular_deadband = 0.02;
-double max_angular_error = 10*3.1415927/180.0;
-double max_velocity_error = 0.05;
-double max_angular_accel = 0.5;
-double max_linear_accel = 0.3;
-double ITerm[2];
-double last_v=0,last_angv=0;
+double error = 0;
+double error_last = 0;
+double integral = 0;
+double derivative = 0; 
+double Kp = 0.8;
+double Ki = 0.5;
+double Kd = 0.1;
+double deadband = 0.02;
 
-int count = 0;
+int position = 0;
+int target_position = 0;
+
+double max_duty_cycle = 100;
+double min_duty_cycle = 15;
 
 bool odometry_active = false;
 
-ros::Time last_velocity_command;
-
 bool motors_active = false;
 bool initialised = false;
+
+void stop_motors()
+{
+  CPhidgetMotorControl_setVelocity (phid, 0, 0);
+  CPhidgetMotorControl_setBraking (phid, 0, 100);
+  motors_active = false;
+}
+
+void start_motors(double duty_cycle)
+{
+  CPhidgetMotorControl_setBraking (phid, 0, 0);
+  CPhidgetMotorControl_setVelocity (phid, 0, duty_cycle);
+  CPhidgetMotorControl_setAcceleration (phid, 0, acceleration);
+  motors_active = true;
+}
+
+void PID(int dt, int actual_position)
+{
+  error = target_position - actual_position;
+  double duty_cycle = (Kp * error) + (Ki * integral) + (Kd * derivative);
+ 
+  if (duty_cycle > 100)
+    duty_cycle = 100;
+  else if (duty_cycle < -100)
+    duty_cycle = -100;
+  else
+    integral += (error * dt);
+ 
+  derivative = (error - error_last)/dt;
+  error_last = error;
+
+  if (duty_cycle == 0)
+    stop_motors();
+  else
+    start_motors(duty_cycle);
+}
 
 int AttachHandler(CPhidgetHandle phid, void *userptr)
 {
@@ -149,13 +178,18 @@ int CurrentChangeHandler(CPhidgetMotorControlHandle MC, void *usrptr, int Index,
 
 int EncoderChangeHandler(CPhidgetMotorControlHandle MC, void *userPtr, int Index, int Time, int positionChange)
 {
+  position += positionChange; 
+
   phidgets::encoder_params m;
   m.index = Index;
-  m.count = count + positionChange;
+  m.count = position;
   m.count_change = positionChange;
   m.time = Time;
 
-  if (initialised) encoder_pub.publish(m);
+  encoder_pub.publish(m);
+
+  PID(Time, position);
+
   return 0;
 }
 
@@ -232,12 +266,12 @@ bool attach(CPhidgetMotorControlHandle &phid, int serial_number)
   }
   int result;
   if((result = CPhidget_waitForAttachment((CPhidgetHandle)phid, 10000)))
-	{
-		const char *err;
-		CPhidget_getErrorDescription(result, &err);
-		ROS_ERROR("Problem waiting for motor attachment: %s", err);
-		return false;
-	}
+  {
+    const char *err;
+    CPhidget_getErrorDescription(result, &err);
+    ROS_ERROR("Problem waiting for motor attachment: %s", err);
+    return false;
+  }
   else return true;
 }
 
@@ -250,243 +284,16 @@ void disconnect(CPhidgetMotorControlHandle &phid)
   CPhidget_close((CPhidgetHandle)phid);
   CPhidget_delete((CPhidgetHandle)phid);
 }
-
-void odometryCallback(const nav_msgs::Odometry::ConstPtr& ptr)
+/*
+void positionCommandCallback(const geometry_msgs::Twist::ConstPtr& msg)
 {
-  if (initialised) 
-  {
-    nav_msgs::Odometry o = *ptr;
-
-    odom.header.stamp = o.header.stamp;
-    odom.header.frame_id = o.header.frame_id;
-    odom.pose.pose.position.x = o.pose.pose.position.x;
-    odom.pose.pose.position.y = o.pose.pose.position.y;
-    odom.pose.pose.position.z = o.pose.pose.position.z;
-    odom.pose.pose.orientation = o.pose.pose.orientation;
-    odom.child_frame_id = o.child_frame_id;
-    odom.twist.twist.linear.x = o.twist.twist.linear.x;
-    odom.twist.twist.linear.y = o.twist.twist.linear.y;
-    odom.twist.twist.angular.z = o.twist.twist.angular.z;
-
-    odometry_active = true;
-  }
+  target_position = msg->linear.x;
 }
+*/
 
-/*!
- * \brief callback when a velocity command is received
- * \param ptr encoder parameters
- */
-void velocityCommandCallback(const geometry_msgs::Twist::ConstPtr& ptr)
+void positionCommandCallback(const std_msgs::Int32::ConstPtr& msg)
 {
-  if (initialised) 
-  {
-    geometry_msgs::Twist m = *ptr;
-    // convert Twist to motor velocities
-    float rotate,forward;
-    double incr,dInput;
-
-    float x = m.linear.x;
-    float y = m.angular.z;
-
-    if ((m.linear.x!=0) || (m.angular.z!=0)) 
-    {
-      //ROS_DEBUG("cmd_vel %.3f angular %.3f", m.linear.x,m.angular.z);
-      //ROS_DEBUG("actual  %.3f/%.3f angular %.3f", odom.twist.twist.linear.x, odom.twist.twist.linear.y, odom.twist.twist.angular.z);
-    }
-    else 
-    {
-      //ROS_DEBUG("Zero speed");
-    }
-
-    if (x_forward) 
-    {
-      rotate = y;
-      forward = x;
-    }
-    else 
-    {
-      rotate = x;
-      forward = y;
-    }
-    float forward_speed = speed * forward;
-
-    ros::Time current_time = ros::Time::now();
-    if (odometry_active) 
-    {
-      if (motors_active) 
-      {
-        double time_elapsed = (current_time - odom.header.stamp).toSec();
-                
-        if (time_elapsed > 0.001) 
-        {
-          double angular_velocity_error = rotate - odom.twist.twist.angular.z;
-
-          // how fast are we actually moving?
-          double vx = odom.twist.twist.linear.x;
-          double vy = odom.twist.twist.linear.y;
-          double v = sqrt(vx*vx + vy*vy);
-          if (forward<0) v=-v;
-
-          // forward velocity error
-          double forward_velocity_error = forward - v;
-
-          double angular_accel = angular_velocity_error / time_elapsed;
-          
-          if (fabs(angular_accel) > max_angular_accel) 
-          {
-            ROS_DEBUG("Angular acceleration limit reached");
-            
-            if (angular_accel > 0) 
-            {
-              angular_accel = max_angular_accel;
-            }
-            else 
-            {
-              angular_accel = -max_angular_accel;
-            }
-          }
-
-          if (fabs(angular_velocity_error) > max_angular_error) 
-          {
-            ROS_WARN("Angular velocity error %f degrees/sec = %f - %f", angular_velocity_error*180/3.1415927, rotate, odom.twist.twist.angular.z);
-          }
-          
-          if ((rotate>0.1) && (odom.twist.twist.angular.z<-0.1)) 
-          {
-            ROS_WARN("Rotation command positive and odometry direction negative");
-          }
-          
-          if ((rotate<-0.1) && (odom.twist.twist.angular.z>0.1)) 
-          {
-            ROS_WARN("Rotation command negative and odometry direction positive");
-          }
-                    
-          if (fabs(forward_velocity_error) > max_velocity_error) 
-          {
-          }
-          double linear_accel = forward_velocity_error / time_elapsed;
-                    
-          if (fabs(linear_accel) > max_linear_accel) 
-          {
-            ROS_WARN("Linear acceleration limit %f/%f reached", linear_accel,max_linear_accel);
-            
-            if (linear_accel > 0) 
-            {
-              linear_accel = max_linear_accel;
-            }
-            else 
-            {
-              linear_accel = -max_linear_accel;
-            }
-          }
-
-          // linear integral and derivative
-          ITerm[0] += linear_velocity_integral * linear_accel;
-                    
-          if (ITerm[0] > max_linear_accel) 
-          {
-            ITerm[0] = max_linear_accel;
-          }
-          else 
-          {
-            if (ITerm[0] < -max_linear_accel) 
-            {
-							ITerm[0] = -max_linear_accel;
-						}
-          }
-
-          if (fabs(forward)>linear_deadband) 
-          {
-            incr = (linear_velocity_proportional * linear_accel) + ITerm[0] - (linear_velocity_derivative * (v - last_v));
-            
-            if (invert_forward) 
-            {
-              incr = -incr;
-            }
-            current_linear_velocity += incr;
-          }
-          else 
-          {
-            current_linear_velocity *= 0.8;
-          }
-          
-          if (current_linear_velocity > speed) 
-          {
-						current_linear_velocity = speed;
-					}
-                    
-          if (current_linear_velocity <-speed) 
-          {
-						current_linear_velocity = -speed;
-					}
-
-          // angular integral and derivative
-          ITerm[1] += angular_velocity_integral * angular_accel;
-                    
-          if (ITerm[1] > max_angular_accel) 
-          {
-            ITerm[1] = max_angular_accel;
-          }
-          else 
-          {
-            if (ITerm[1] < -max_angular_accel) 
-            {
-							ITerm[1] = -max_angular_accel;
-						}
-          }
-
-          if (fabs(rotate)>angular_deadband) 
-          {
-            incr = (angular_velocity_proportional * angular_accel) + ITerm[1] - (angular_velocity_derivative * (odom.twist.twist.angular.z - last_angv));
-                        
-            if (invert_rotation) 
-            {
-              incr = -incr;
-            }
-            current_angular_velocity += incr;
-          }
-          else 
-          {
-            current_angular_velocity *= 0.8;
-          }
-          
-          if (current_angular_velocity > max_angular_velocity) 
-          {
-						current_angular_velocity = max_angular_velocity;
-					}
-                    
-          if (current_angular_velocity < -max_angular_velocity) 
-          {
-						current_angular_velocity = -max_angular_velocity;
-					}
-
-          CPhidgetMotorControl_setVelocity (phid, 1, current_linear_velocity + current_angular_velocity);
-          CPhidgetMotorControl_setVelocity (phid, 0, -current_linear_velocity + current_angular_velocity);
-          CPhidgetMotorControl_setAcceleration (phid, 0, acceleration);
-          CPhidgetMotorControl_setAcceleration (phid, 1, acceleration);
-
-          last_v = v;
-          last_angv = odom.twist.twist.angular.z;
-        }
-      }
-    }
-    else 
-    {
-      CPhidgetMotorControl_setVelocity (phid, 0, forward_speed); //-forward_speed - (rotate*speed));
-      //CPhidgetMotorControl_setVelocity (phid, 1, forward_speed - (rotate*speed));
-      CPhidgetMotorControl_setAcceleration (phid, 0, acceleration);
-      //CPhidgetMotorControl_setAcceleration (phid, 1, acceleration);
-    }
-    last_velocity_command = current_time;
-    motors_active = true;
-  }
-}
-
-void stop_motors()
-{
-  CPhidgetMotorControl_setVelocity (phid, 0, 0);
-  CPhidgetMotorControl_setBraking (phid, 0, 100);
-  motors_active = false;
+  target_position = msg->data;
 }
 
 int main(int argc, char* argv[])
@@ -500,59 +307,15 @@ int main(int argc, char* argv[])
   nh.getParam("name", name);
   nh.getParam("x_forward", x_forward);
   nh.getParam("rotation", rotation_offset);
-  std::string odometry_topic = "odom";
-  nh.getParam("odometry", odometry_topic);
-  double g = 0;
-  const double min_g = 0.00001;
-  nh.getParam("max_angular_error", g);
-  if (g>min_g) max_angular_error = g;
-  g=0;
-  nh.getParam("max_velocity_error", g);
-  if (g>min_g) max_velocity_error = g;
-  g=0;
-  nh.getParam("linear_deadband", g);
-  if (g>min_g) linear_deadband = g;
-  g=0;
-  nh.getParam("angular_deadband", g);
-  if (g>min_g) angular_deadband = g;
-  g=0;
-  nh.getParam("linear_proportional", g);
-  if (g>min_g) linear_velocity_proportional = g;
-  g=0;
-  nh.getParam("linear_integral", g);
-  if (g>min_g) linear_velocity_integral = g;
-  g=0;
-  nh.getParam("linear_derivative", g);
-  if (g>min_g) linear_velocity_derivative = g;
-  g=0;
-  nh.getParam("angular_proportional", g);
-  if (g>min_g) angular_velocity_proportional = g;
-  g=0;
-  nh.getParam("angular_integral", g);
-  if (g>min_g) angular_velocity_integral = g;
-  g=0;
-  nh.getParam("angular_derivative", g);
-  if (g>min_g) angular_velocity_derivative = g;
-  g=0;
-  nh.getParam("max_angular_velocity", g);
-  if (g>min_g) max_angular_velocity = g;
-  nh.getParam("invert_rotation", invert_rotation);
-  nh.getParam("invert_forward", invert_forward);
+
   if (serial_number==-1) 
   {
     nh.getParam("serial_number", serial_number);
   }
 
-  g=0;
-  nh.getParam("max_angular_accel", g);
-  if (g>0) max_angular_accel = g;
-  g=0;
-  nh.getParam("max_linear_accel", g);
-  if (g>0) max_linear_accel = g;
-
   std::string topic_path = "phidgets/";
   nh.getParam("topic_path", topic_path);
-  int timeout_sec = 2;
+  int timeout_sec = 1;
   nh.getParam("timeout", timeout_sec);
   int v=0;
   nh.getParam("speed", v);
@@ -560,12 +323,9 @@ int main(int argc, char* argv[])
   int frequency = 30;
   nh.getParam("frequency", frequency);
 
-  ITerm[0]=0;
-  ITerm[1]=0;
-
   if (attach(phid, serial_number)) 
   {
-		display_properties(phid);
+    display_properties(phid);
 
     const int buffer_length = 100;        
     std::string topic_name = topic_path + name;
@@ -581,14 +341,13 @@ int main(int argc, char* argv[])
     }
     motors_pub = n.advertise<phidgets::motor_params>(topic_name, buffer_length);
 
-    // receive velocity commands
-    ros::Subscriber command_velocity_sub = n.subscribe("cmd_vel", 1, velocityCommandCallback);
-
-    // subscribe to odometry
-    ros::Subscriber odometry_sub = n.subscribe(odometry_topic, 1, odometryCallback);
+    // receive position commands
+    ros::Subscriber position_sub = n.subscribe("fork_pose", 1, positionCommandCallback);
     
     // publish encoder counts
     encoder_pub = n.advertise<phidgets::encoder_params>("fork_encoder", 5);
+
+    ros::Time last_command = ros::Time::now();
 
     initialised = true;
     ros::Rate loop_rate(frequency);
@@ -600,8 +359,8 @@ int main(int argc, char* argv[])
       
       // SAFETY FEATURE
       // if a velocity command has not been received
-			// for a period of time then stop the motors
-      double time_since_last_command_sec = (ros::Time::now() - last_velocity_command).toSec();
+      // for a period of time then stop the motors
+      double time_since_last_command_sec = (ros::Time::now() - last_command).toSec();
       if ((motors_active) && (time_since_last_command_sec > timeout_sec)) 
       {
         stop_motors();        
