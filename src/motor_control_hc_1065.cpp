@@ -69,9 +69,6 @@ double deadband = 0.02;
 int position = 0;
 int target_position = 0;
 
-double max_duty_cycle = 100;
-double min_duty_cycle = 15;
-
 bool odometry_active = false;
 
 bool motors_active = false;
@@ -107,7 +104,7 @@ void PID(int dt, int actual_position)
   derivative = (error - error_last)/dt;
   error_last = error;
 
-  if (duty_cycle == 0)
+  if (duty_cycle == 0 || error == 0)
     stop_motors();
   else
     start_motors(duty_cycle);
